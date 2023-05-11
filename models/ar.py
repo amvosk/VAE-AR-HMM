@@ -69,6 +69,11 @@ class Autoregression(nn.Module):
         return matrix_inverse
 
     def fit(self, x_mean, x_cov, gamma=None):
+        if len(x_mean.shape) == 3:
+            x_mean = einops.rearrange(x_mean, '1 c t -> c t')
+        if len(x_cov.shape) == 4:
+            x_cov = einops.rearrange(x_cov, '1 c C t -> c C t')
+        
         n_samples = x_mean.shape[-1]
         pad = torch.nn.ConstantPad1d(padding=(self.config.ar_order, 0), value=0)
         x_mean_pad = self.pad(x_mean)
@@ -88,31 +93,40 @@ class Autoregression(nn.Module):
         return es
     
     def emission_log_prob(self, x_mean):
+        if len(x_mean.shape) < 3:
+            x_mean = einops.rearrange(x_mean, 'c t -> 1 c t')
         n_samples = x_mean.shape[-1]
         es = self._signal_whitening(x_mean)
+        # print('es', es.shape)
         
         Dlog2pi = self.config.n_features * math.log(2*math.pi)
         
         _, logabsdet = torch.linalg.slogdet(self.Sigma)
-        logabsdet = einops.rearrange(logabsdet, 'k -> k 1')
+        logabsdet = einops.rearrange(logabsdet, 'k -> 1 k 1')
 
         cholesky_factor = torch.linalg.cholesky(self.Sigma)
+        cholesky_factor = einops.rearrange(cholesky_factor, 'k c C -> k 1 c C')
+        # print('cholesky_factor', cholesky_factor.shape)
         es_scaled = torch.cholesky_solve(es, cholesky_factor)
-        mahalanobis = torch.einsum('kct, kct -> kt', es, es_scaled)
+        # print('es_scaled', es_scaled.shape)
+        mahalanobis = torch.einsum('kbct, kbct -> bkt', es, es_scaled)
         
         log_prob = - 1/2 * (Dlog2pi + logabsdet + mahalanobis)
         return log_prob
         
     def emission_log_prob_pytorch(self, x_mean):
+        if len(x_mean.shape) < 3:
+            x_mean = einops.rearrange(x_mean, 'c t -> 1 c t')
         from torch.distributions import MultivariateNormal
         
-        log_prob = torch.zeros(self.config.n_states, x_mean.shape[-1], device=x_mean.device)
+        log_prob = torch.zeros((1, self.config.n_states, x_mean.shape[-1]), device=x_mean.device)
         es = self._signal_whitening(x_mean)
-        es = einops.rearrange(es, 'k c t -> k t c')
+        es = einops.rearrange(es, 'k b c t -> b k t c')
 
         for k in range(self.config.n_states):
-            covariance_matrix_k = self.Sigma[k]
-            distribution = MultivariateNormal(torch.zeros(self.config.n_features, device=x_mean.device), self.Sigma[k])
+            # covariance_matrix_k = self.Sigma[k]
+            # covariance_matrix_k = einops.rearrange(covariance_matrix_k, 'c C -> 1 k c C')
+            distribution = MultivariateNormal(torch.zeros((1, self.config.n_features), device=x_mean.device), self.Sigma[k])
             log_prob[k] = distribution.log_prob(es[k])
         return log_prob
     
@@ -279,6 +293,21 @@ class Autoregression(nn.Module):
         elif self.config.covariance_type == 'identity':
             identity = einops.repeat(torch.eye(self.config.n_features, device=Sigma_hat.device), 'c C -> k c C', k=self.config.n_states)
             return identity
+        
+    def sample(self, x_mean, x_cov, n_samples, random_seed=None):
+        if random_seed is not None:
+            torch.manual_seed(random_seed)
+        if len(x_mean.shape) < 3:
+            x_mean = einops.rearrange(x_mean, 'c t -> 1 c t')
+        if len(x_cov.shape) < 4:
+            x_cov = einops.rearrange(x_cov, 'c C t -> 1 c C t')
+        eps = torch.randn(size=(n_samples, *x_mean.shape), device=x_mean.device)
+        x_cov_reshaped = einops.rearrange(x_cov, 'b c C t -> b t c C')
+        cholesky_factor = torch.linalg.cholesky(x_cov_reshaped)
+        x_samples = torch.einsum('btcC, sbCt -> sbct', cholesky_factor, eps)
+        x_samples = x_samples + einops.repeat(x_mean, 'b c t -> s b c t', s=n_samples)
+        x_samples = einops.rearrange(x_samples, 's b c t -> (s b) c t')
+        return x_samples
     
     
     def reset(self):

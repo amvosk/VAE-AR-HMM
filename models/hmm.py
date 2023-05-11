@@ -201,20 +201,23 @@ class HMM(nn.Module):
         log_gamma, _ = self.gamma_calculation(log_alpha, log_beta, mask)
         log_xi = self.xi_calculation(log_alpha, log_beta, emissions, mask)
         
+        log_gamma = torch.logsumexp(log_gamma, dim=0) - math.log(log_gamma.shape[0])
+        log_xi = torch.logsumexp(log_xi, dim=0) - math.log(log_xi.shape[0])
+        
         log_init_state = log_gamma[...,0]
         init_state = torch.exp(log_init_state)**self.config.temperature
-        init_state = torch.mean(init_state, dim=0)
+        # init_state = torch.mean(init_state, dim=0)
         self.init_state = init_state / torch.sum(init_state)
         
         log_transition_matrix = torch.logsumexp(log_xi, dim=-1) - torch.logsumexp(log_gamma[...,:-1], dim=-1).unsqueeze(-1)
         transition_matrix = torch.exp(log_transition_matrix)**self.config.temperature
-        transition_matrix = torch.mean(transition_matrix, dim=0)
+        # transition_matrix = torch.mean(transition_matrix, dim=0)
         self.transition_matrix = transition_matrix / torch.sum(transition_matrix, dim=1, keepdims=True)
 
         log_prob = torch.logsumexp(log_alpha[...,-1], dim=-1)
         log_prob = torch.mean(log_prob, dim=0)
         gamma = torch.exp(log_gamma)
-        gamma = torch.mean(gamma, dim=0)
+        # gamma = torch.mean(gamma, dim=0)
         return log_prob, gamma
     
         

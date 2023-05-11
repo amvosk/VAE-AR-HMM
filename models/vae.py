@@ -19,273 +19,343 @@ from dataclasses import dataclass
     
     
 @dataclass
-class ARConfig:
-    n_states: int
+class VAEConfig:
+    n_channels: int
     n_features: int
-    ar_order: int
-    covariance_type: str
+    log_transform: bool
+    fs: int
+    fsamp: int
+    ma_order_encoder: int
+    ma_order_decoder: int
+    use_ma_bias: bool
+    ma_bias_common: bool
+    use_cov_scaler: bool
+
+    
+    
 
 
-class Autoregression(nn.Module):
-    def __init__(self, config):
+class Rectifier(nn.Module):
+    def __init__(self, log_transform=False, logeps=1e-7):
         super(self.__class__,self).__init__()
-        self.config = config
-        # self.n_states = config.n_states
-        # self.n_features = config.n_features
-        # self.ar_order = config.ar_order
+        self.log_transform = log_transform
+        self.eps = logeps
         
-        self.pad = nn.ConstantPad1d(padding=(self.config.ar_order, 0), value=0)
-        
-        An = torch.zeros((self.config.n_states, self.config.ar_order + 2, self.config.n_features, self.config.n_features))
-        An[:,0,:,:] = - einops.repeat(torch.eye(self.config.n_features), 'c C -> k c C', k=self.config.n_states)
-        self.register_buffer("An", An)
-        
-        Sigma = einops.repeat(torch.eye(self.config.n_features), 'c C -> k c C', k=self.config.n_states)
-        self.register_buffer("Sigma", Sigma)
-        
-        self.whitening_filters = torch.nn.ModuleList()
-        for k in range(self.config.n_states):
-            conv1d = torch.nn.Conv1d(self.config.n_features, self.config.n_features, kernel_size=self.config.ar_order+1)
-            for param in conv1d.parameters():
-                param.requires_grad = False
-            self.whitening_filters.append(conv1d)
-        self._update_filters()
-        
-    def _update_filters(self):
-        An = self._get_ar_coef()
-        mean = self._get_mean()
-        for k in range(self.config.n_states):
-            Akn = torch.flip(An[k], dims=(0,))
-            Akn = einops.rearrange(Akn, 'n c C -> c C n')
-            if self.config.ar_order > 0:
-                self.whitening_filters[k].weight.data[:,:,:-1] = - Akn
-            self.whitening_filters[k].weight.data[:,:,-1] = torch.eye(self.config.n_features, device=Akn.device)
-            self.whitening_filters[k].bias.data = - mean[k]
-
-        
-    def _cholesky_inverse(self, matrix):
-        cholesky_factor = torch.linalg.cholesky(matrix)
-        matrix_inverse = torch.cholesky_inverse(cholesky_factor)
-        return matrix_inverse
-
-    def fit(self, x_mean, x_cov, gamma=None):
-        n_samples = x_mean.shape[-1]
-        pad = torch.nn.ConstantPad1d(padding=(self.config.ar_order, 0), value=0)
-        x_mean_pad = self.pad(x_mean)
-        x_cov_pad = self.pad(x_cov)
+    def forward(self, s):
+        s_abs = torch.abs(s)
+        s_sign = torch.sign(s)
+        if self.log_transform:
+            s_abs = 2 * torch.log(s_abs + self.eps)
+        return s_abs, s_sign
     
-        if gamma is None:
-            gamma = torch.ones((self.config.n_states, n_samples), device=x_mean.device) / self.config.n_states
-        self.An[:,1:,:,:] = torch.clone(self._estimate_autoregression(x_mean, x_cov, gamma))
-        Sigma = torch.clone(self._estimate_covariance(x_mean, x_cov, gamma))
-        self.Sigma = self._transform_covariance(Sigma)
-        self._update_filters()
-        
-    def _signal_whitening(self, x_mean):
-        es = torch.zeros(self.config.n_states, *x_mean.size(), device=x_mean.device)
-        for k in range(self.config.n_states):
-            es[k] = self.whitening_filters[k](self.pad(x_mean))
-        return es
-    
-    def emission_log_prob(self, x_mean):
-        n_samples = x_mean.shape[-1]
-        es = self._signal_whitening(x_mean)
-        
-        Dlog2pi = self.config.n_features * math.log(2*math.pi)
-        
-        _, logabsdet = torch.linalg.slogdet(self.Sigma)
-        logabsdet = einops.rearrange(logabsdet, 'k -> k 1')
+    def reverse(self, s_abs, s_sign):
+        if self.log_transform:
+            s_abs = torch.exp(s_abs / 2) - self.eps
+        s = s_abs * s_sign
+        return s
 
-        cholesky_factor = torch.linalg.cholesky(self.Sigma)
-        es_scaled = torch.cholesky_solve(es, cholesky_factor)
-        mahalanobis = torch.einsum('kct, kct -> kt', es, es_scaled)
-        
-        log_prob = - 1/2 * (Dlog2pi + logabsdet + mahalanobis)
-        return log_prob
-        
-    def emission_log_prob_pytorch(self, x_mean):
-        from torch.distributions import MultivariateNormal
-        
-        log_prob = torch.zeros(self.config.n_states, x_mean.shape[-1], device=x_mean.device)
-        es = self._signal_whitening(x_mean)
-        es = einops.rearrange(es, 'k c t -> k t c')
-
-        for k in range(self.config.n_states):
-            covariance_matrix_k = self.Sigma[k]
-            distribution = MultivariateNormal(torch.zeros(self.config.n_features, device=x_mean.device), self.Sigma[k])
-            log_prob[k] = distribution.log_prob(es[k])
-        return log_prob
     
-    def get_posterior_base_slow(self, x_mean, gamma):
-        n_samples = x_mean.shape[-1]
-        x_mean_pad = self.pad(x_mean)
-        
-        cov_hat_inv = self._cholesky_inverse(self.Sigma)
-        gcov_hat_inv = torch.einsum('kt,kcC->tcC', gamma, cov_hat_inv)
-        gcov_hat = self._cholesky_inverse(gcov_hat_inv)
-
-        An_filt = torch.flip(self.An[:,1:], dims=(1,))
-
-        gmean_hat = torch.zeros((n_samples, self.config.n_features), device=gcov_hat.device)
-        for t in range(n_samples):
-            x_mean_chunk = x_mean_pad[...,t:t+self.config.ar_order]
-            x_mean_chunk = torch.cat([torch.ones((self.config.n_features,1), device=x_mean_chunk.device), x_mean_chunk], dim=-1)
-            gmean_hat[t] = torch.einsum('cC, k, kCs, knsS, Sn -> c', gcov_hat[t], gamma[...,t], cov_hat_inv, An_filt, x_mean_chunk)
-        return gmean_hat, gcov_hat
+class Downsampler(nn.Module):
+    def __init__(self, in_fs, out_fs):
+        super(self.__class__,self).__init__()
+        self.downsample_coef = int(in_fs / out_fs)
     
-    def get_posterior_base(self, x_mean, gamma):
-        n_samples = x_mean.shape[-1]
-        x_mean_pad = self.pad(x_mean)
-        
-        cov_hat_inv = self._cholesky_inverse(self.Sigma)
-        gcov_hat_inv = torch.einsum('kt,kcC->tcC', gamma, cov_hat_inv)
-        gcov_hat = self._cholesky_inverse(gcov_hat_inv)
-        gcov_hat = einops.rearrange(gcov_hat, 't c C -> c C t')
-        
-        Amun = torch.zeros(
-            (self.config.n_states, self.config.ar_order + 1, self.config.n_features, n_samples), 
-            device=x_mean_pad.device
-        )
-        for i in range(self.config.ar_order):
-            Amun[:,i,...] = torch.einsum(
-                'kcC, Ct -> kct', self.An[:,i], x_mean_pad[:,self.config.ar_order-i:n_samples+self.config.ar_order-i]
-            )
-        Amun[:,-1,...] = einops.repeat(torch.diagonal(self.An[:,-1], dim1=-2, dim2=-1), 'k c -> k c t', t=n_samples)
-        Amun = torch.einsum('knCt -> kCt', Amun)
-        
-        gmean_hat = torch.einsum('sct, kt, kcC, kCt -> st', gcov_hat, gamma, cov_hat_inv, Amun)
-        return gmean_hat, gcov_hat
+    def forward(self, s_abs):
+        s_abs_ = einops.rearrange(s_abs, 'b c (t d) -> b c d t', d=self.downsample_coef)
+        a_mean = einops.reduce(s_abs_, 'b c d t -> b c t', 'mean')
+        a_mean_ = einops.rearrange(a_mean, 'b c t -> b c 1 t')
+        s_centered = s_abs_ - a_mean_
+        a_cov = torch.einsum('bcdt,bCdt->bcCt', s_centered, s_centered) / (self.downsample_coef-1)
+        return a_mean, a_cov
+
     
-    def _get_ar_coef(self):
-        return torch.clone(self.An[:,1:-1])
-    def _get_mean(self):
-        return torch.clone(torch.diagonal(self.An[:,-1], dim1=-2, dim2=-1))
-    def _get_cov(self):
-        return torch.clone(self.Sigma)
+class Upsampler(nn.Module):
+    def __init__(self, in_fs, out_fs):
+        super(self.__class__,self).__init__()
+        self.upsample_coef = int(out_fs / in_fs)
+        
+    def forward(self, a_mean_tilde, a_cov_tilde=None, cov_propagation=False):
+        s_abs = einops.repeat(a_mean_tilde, 'b c t -> b c (t d)', d=self.upsample_coef)
+        s_cov = einops.repeat(a_cov_tilde, 'b c C t -> b c C (t d)', d=self.upsample_coef) if cov_propagation else None
+        return s_abs, s_cov
+
+    
+class MovingAverage(nn.Module):
+    def __init__(self, order, n_features, use_bias=True, bias_common=False, random_seed=None):
+        super(self.__class__,self).__init__()
+        if random_seed is not None:
+            torch.manual_seed(random_seed)
+        
+        self.order = order
+        self.n_features = n_features
+        
+        # self.pad = nn.ConstantPad1d(padding=(order, 0), value=0)
+        parameter_shape = (n_features, n_features, order)
+        
+        
+        self.use_bias = use_bias
+        self.bias_common = bias_common
+        if self.use_bias and not self.bias_common:
+            self.bias = nn.Parameter(torch.Tensor(n_features))
+            nn.init.constant_(self.bias, 0)
+  
+        if order > 0:
+            self.moving_average = nn.Parameter(torch.Tensor(n_features, n_features, order))
+            nn.init.kaiming_uniform_(self.moving_average, a=0.01)
             
-    def _estimate_autoregression(self, x_mean, x_cov, gamma):
-        An_hat = torch.zeros((self.config.n_states, self.config.ar_order + 1, self.config.n_features, self.config.n_features), device=x_mean.device)
-        x_meanT = einops.rearrange(x_mean, 'c t -> t c')
-        x_covT = einops.rearrange(x_cov, 'c C t -> t c C')
-        
+            identity = torch.eye(n_features).unsqueeze(-1).to(self.moving_average.device)
+            self.register_buffer("identity", identity)
 
-        N, D = self.config.ar_order, self.config.n_features
-        if N > 0:
-            covn = [torch.cat((torch.zeros((n, self.config.n_features, self.config.n_features), device=x_mean.device), x_covT[:-n]), dim=0) for n in range(1, N+1)]
-            covn = torch.stack(covn)
-            # print(gamma.shape, covn.shape)
-            gcov = torch.einsum('kt,ntcC->kncC', gamma, covn)
-        
-        for k in range(self.config.n_states):
-            g = einops.rearrange(gamma[k], 't -> t 1')
-            xn = [x_meanT] + [torch.cat((torch.zeros((n, self.config.n_features), device=x_mean.device), x_meanT[:-n]), dim=0) for n in range(1, N+1)]
-            xng = [g*xn_ for xn_ in xn]
+    def forward(self, a_mu, a_Sigma=None, cov_propagation=True, bias=None):
+        x_Sigma = None
 
-            B = torch.sum(xng[0], dim=0, keepdims=True)
-            if N > 0:
-                B = torch.cat([(xn[n].T @ xng[0]) for n in range(1, N+1)] + [B], dim=0)
+        if self.order > 0:
+            batch_size = a_mu.shape[0]
+            n_timestamps = a_mu.shape[-1]
 
-            M = torch.zeros((N*D+1, N*D+1), device=x_mean.device)
-            for i in range(1, N+1):
-                x_ = torch.sum(xng[i], dim=0)
-                M[-1,(i-1)*D:i*D] = x_
-                M[(i-1)*D:i*D,-1] = x_
-            M[-1,-1] = torch.sum(g)
+            filtr = torch.cat([self.moving_average, self.identity], dim=-1)
 
-            for i in range(1, N+1):
-                for j in range(1, N+1):
-                    if j > i: 
-                        xgx = xn[i].T @ xng[j]
-                        M[D*(i-1):D*i, D*(j-1):D*j] = xgx
-                        M[D*(j-1):D*j, D*(i-1):D*i] = xgx.T
-                    elif j == i:
-                        xgx = xn[i].T @ xng[j]
-                        M[D*(i-1):D*i, D*(j-1):D*j] = xgx + gcov[k,i-1]
+            x_mu = torch.zeros((batch_size, self.n_features, n_timestamps-self.order))
+            for i in range(n_timestamps-self.order):
+                x_mu[...,i] = torch.einsum('bCt,cCt->bc', a_mu[...,i:i+self.order+1], filtr)
 
-            cholesky_factor = torch.linalg.cholesky(M)
-            A = torch.cholesky_solve(B, cholesky_factor)
-
-            if N > 0:
-                An_hat[k,:-1] = einops.rearrange(A[:-1], '(N D) d -> N d D', N=N)
-            An_hat[k,-1] = torch.diag(A[-1])
-        return An_hat
+            if cov_propagation:
+                x_Sigma = torch.zeros((batch_size, self.n_features, self.n_features, n_timestamps-self.order))
+                for i in range(n_timestamps-self.order):
+                    x_Sigma[...,i] = torch.einsum('bCSt,cCt,sSt->bcs', a_Sigma[...,i:i+self.order+1], filtr, filtr)
+                    
+        elif self.order == 0:
+            x_mu = a_mu
+            if cov_propagation:
+                x_Sigma = a_Sigma
+                
+        if self.use_bias:
+            if not self.bias_common:
+                bias = self.bias
+            bias = einops.rearrange(bias, 'c -> 1 c 1')
+            x_mu = x_mu + bias
+        return x_mu, x_Sigma
     
-    def _estimate_covariance_slow(self, x_mean, x_cov, gamma):
-        n_samples = x_mean.shape[-1]
-        x_mean_pad = self.pad(x_mean)
-        x_cov_pad = self.pad(x_cov)
-
-        An_mean = torch.flip(self.An, dims=(1,))
-        An_cov = torch.flip(self.An[:,:-1], dims=(1,))
-
-        cov = torch.zeros((self.config.n_states, self.config.n_features, self.config.n_features, n_samples), device=x_mean_pad.device)
-        for t in range(n_samples):
-            x_mean_chunk = x_mean_pad[...,t:t+self.config.ar_order+1]
-            x_mean_chunk = torch.cat([torch.ones((self.config.n_features,1), device=x_mean_chunk.device), x_mean_chunk], dim=-1)
-            x_cov_chunk = x_cov_pad[...,t:t+self.config.ar_order+1]
-            left = torch.einsum('kncC, CSn, knsS -> kcs', An_cov, x_cov_chunk, An_cov)
-            right = torch.einsum('kncC, Cn, Sm, kmsS -> kcs', An_mean, x_mean_chunk, x_mean_chunk, An_mean)
-            cov[...,t] = left + right
-
-        gamma_sum = einops.rearrange(torch.einsum('tk->k', gamma), 'k -> k 1 1')
-        cov_hat = torch.einsum('tk,kcCt->kcC', gamma, cov) / gamma_sum
-        return cov_hat
     
-    def _estimate_covariance(self, x_mean, x_cov, gamma):
-        n_samples = x_mean.shape[-1]
-        x_mean_pad = self.pad(x_mean)
-        x_cov_pad = self.pad(x_cov)
+class SpatialFilter(nn.Module):
+    def __init__(self, in_channels, out_channels, random_seed=None):
+        super(self.__class__,self).__init__()
+        if random_seed is not None:
+            torch.manual_seed(random_seed)
+            
+        self.weight = nn.Parameter(torch.Tensor(out_channels, in_channels))
+        nn.init.kaiming_uniform_(self.weight, a=0.01)
+        
+    def forward(self, mean, cov=None, cov_propagation=False):
+        mean = torch.einsum('bit, Oi -> bOt', mean, self.weight)
+        cov = torch.einsum('biIt, oi, OI -> boOt', cov, self.weight, self.weight) if cov_propagation else None
+        return mean, cov
 
-        Amun = torch.zeros(
-            (self.config.n_states, self.config.ar_order + 2, self.config.n_features, n_samples), 
-            device=x_mean_pad.device
+    
+class Encoder(nn.Module):
+    def __init__(self, config, random_seed=None):
+        super(self.__class__,self).__init__()
+        
+        self.config = config
+        self.ds_coef = int(self.config.fs / self.config.fsamp)
+        self.ma_order = self.config.ma_order_encoder + self.config.ma_order_decoder
+        
+        self.spatial_filter = SpatialFilter(self.config.n_channels, self.config.n_features, random_seed)
+        self.rectifier = Rectifier(self.config.log_transform)
+        self.downsampler = Downsampler(in_fs=self.config.fs, out_fs=self.config.fsamp)
+        self.moving_average = MovingAverage(
+            self.config.ma_order_encoder, self.config.n_features, self.config.use_ma_bias, self.config.ma_bias_common, random_seed)
+
+    def forward(self, y_pad, ma_bias=None):
+        s_pad, _ = self.spatial_filter(y_pad)
+        s_abs_pad, s_sign_pad = self.rectifier(s_pad)
+        a_mean_pad, a_cov_pad = self.downsampler(s_abs_pad)
+        x_mean_pad, x_cov_pad = self.moving_average(a_mean_pad, a_cov_pad, cov_propagation=True, bias=ma_bias)
+
+        results = {
+            's':s_pad[...,self.ma_order*self.ds_coef:],
+            's_abs':s_abs_pad[...,self.ma_order*self.ds_coef:],
+            's_sign':s_sign_pad[...,self.ma_order*self.ds_coef:],
+            'a_mean':a_mean_pad[...,self.ma_order:],
+            'a_cov':a_cov_pad[...,self.ma_order:],
+            'x_mean_pad':x_mean_pad,
+            'x_cov_pad':x_cov_pad,
+        }
+        return results
+    
+
+class Decoder(nn.Module):
+    def __init__(self, config, random_seed=None):
+        super(self.__class__,self).__init__()
+        
+        self.config = config
+        self.ds_coef = int(self.config.fs / self.config.fsamp)
+
+        self.moving_average = MovingAverage(
+            self.config.ma_order_decoder, self.config.n_features, self.config.use_ma_bias, self.config.ma_bias_common, random_seed)
+        self.upsampler = Upsampler(in_fs=self.config.fsamp, out_fs=self.config.fs)
+        self.rectifier = Rectifier(self.config.log_transform)
+
+        self.spatial_filter = SpatialFilter(self.config.n_features, self.config.n_channels, random_seed)
+
+
+    def forward(self, x_mean_tilde, x_cov_tilde, s_sign, ma_bias, cov_propagation=False):
+        a_mean_tilde, a_cov_tilde = self.moving_average(x_mean_tilde, x_cov_tilde, cov_propagation=cov_propagation, bias=ma_bias)
+        results = self.forward_amplitude(a_mean_tilde, a_cov_tilde, s_sign, cov_propagation=cov_propagation)
+        results['a_mean_tilde'] = a_mean_tilde
+        results['a_cov_tilde'] = a_cov_tilde
+        return results
+    
+    def forward_amplitude(self, a_mean_tilde, a_cov_tilde, s_sign, cov_propagation=False):
+        s_abs_tilde, s_cov_tilde = self.upsampler(a_mean_tilde, a_cov_tilde, cov_propagation=cov_propagation)
+        s_tilde = self.rectifier.reverse(s_abs_tilde, s_sign)
+        y_mean_tilde, y_cov_tilde = self.spatial_filter(s_tilde, s_cov_tilde, cov_propagation=cov_propagation)
+        results = {
+            's_abs_tilde':s_abs_tilde,
+            's_cov_tilde':s_cov_tilde,
+            's_tilde':s_tilde,
+            'y_mean_tilde':y_mean_tilde,
+            'y_cov_tilde':y_cov_tilde,
+        }
+        return results
+    
+    
+class VAE(nn.Module):
+    def __init__(self, config, random_seed=None):
+        super(self.__class__,self).__init__()
+        
+        self.config = config
+        self.ds_coef = int(self.config.fs / self.config.fsamp)
+        self.ma_order_decoder = self.config.ma_order_decoder
+        self.ma_order = self.config.ma_order_encoder + self.config.ma_order_decoder
+        
+        self.pad_encoder_decoder = nn.ReflectionPad1d(padding=(self.ma_order*self.ds_coef, 0))
+        
+        if random_seed is not None:
+            torch.manual_seed(random_seed)
+            
+        self.ma_bias = 0
+        if self.config.ma_bias_common:
+            self.ma_bias = nn.Parameter(torch.Tensor(self.config.n_features))
+            nn.init.constant_(self.ma_bias, 0)
+        
+        self.encoder = Encoder(self.config, random_seed)
+        self.decoder = Decoder(self.config, random_seed)
+
+        if self.config.use_cov_scaler:
+            self.cov_scaler = nn.Parameter(torch.Tensor(1))
+            nn.init.constant_(self.cov_scaler, 1)
+    
+    def forward(self, y, cov_propagation=False):
+        indices = [0]
+        seq_length = int(y.shape[-1] / self.ds_coef)
+        # y_minibatch, y_mean_tilde, y_cov_tilde, a_mean, a_cov, x_mean, x_cov = self.forward_minibatch(
+        #     y, indices, seq_length, cov_propagation=cov_propagation
+        # )
+        results = self.forward_minibatch(y, indices, seq_length, cov_propagation=cov_propagation)
+        
+        for k, v in results.items():
+            if v is not None:
+                v = v.squeeze(0)
+            results[k] = v
+        return results
+    
+    def forward_minibatch(self, y, indices, seq_length, cov_propagation=False):
+        y_pad = self.pad_encoder_decoder(y)
+        y_minibatch_pad = [y_pad[...,index*self.ds_coef:(index+self.ma_order+seq_length)*self.ds_coef] for index in indices]
+        y_minibatch_pad = torch.stack(y_minibatch_pad)
+        y_minibatch = y_minibatch_pad[...,self.ma_order*self.ds_coef:]
+
+        results_encoder = self.encoder(y_minibatch_pad, ma_bias=self.ma_bias)
+        s_sign = results_encoder['s_sign']
+        x_mean_pad = results_encoder['x_mean_pad']
+        x_cov_pad = results_encoder['x_cov_pad']
+
+        if self.config.use_cov_scaler:
+            x_cov_pad = x_cov_pad * self.cov_scaler  
+        
+        results_decoder = self.decoder(
+            x_mean_pad, x_cov_pad, s_sign, ma_bias=-self.ma_bias, cov_propagation=cov_propagation,
         )
-        ASigman = torch.zeros(
-            (self.config.n_states, self.config.ar_order + 1, self.config.n_features, self.config.n_features, n_samples), 
-            device=x_cov_pad.device
-        )
+
+        results = {
+            'y_minibatch':y_minibatch,
+            's':results_encoder['s'],
+            's_abs':results_encoder['s_abs'],
+            's_sign':s_sign,
+            'a_mean':results_encoder['a_mean'],
+            'a_cov':results_encoder['a_cov'],
+            'x_mean':x_mean_pad[...,self.ma_order_decoder:],
+            'x_cov':x_cov_pad[...,self.ma_order_decoder:],
+            's_abs_tilde':results_decoder['s_abs_tilde'],
+            's_cov_tilde':results_decoder['s_cov_tilde'],
+            's_tilde':results_decoder['s_tilde'],
+            'y_mean_tilde':results_decoder['y_mean_tilde'],
+            'y_cov_tilde':results_decoder['y_cov_tilde'],
+        }
+        return results
+
+    def reset(self, config=None, random_seed=None):
+        if config is not None:
+            self.config = config
+        if random_seed is not None:
+            torch.manual_seed(random_seed)
         
-        for i in range(self.config.ar_order + 1):
-            ASigman[:,i,...] = torch.einsum(
-                'kcs, kCS, sSt -> kcCt', self.An[:,i], self.An[:,i], x_cov_pad[...,self.config.ar_order-i:n_samples+self.config.ar_order-i]
-            )
-            Amun[:,i,...] = torch.einsum(
-                'kcC, Ct -> kct', self.An[:,i], x_mean_pad[:,self.config.ar_order-i:n_samples+self.config.ar_order-i]
-            )
-        Amun[:,-1,...] = einops.repeat(torch.diagonal(self.An[:,-1], dim1=-2, dim2=-1), 'k c -> k c t', t=n_samples)
-        right = torch.einsum('kict, kjCt -> kijcCt', Amun, Amun)
-        right = torch.einsum('kijcCt -> kcCt', right)
-        left = torch.einsum('kicCt -> kcCt', ASigman)
-        Sigma = left + right
+        if self.config.ma_bias_common:
+            self.ma_bias = nn.Parameter(torch.Tensor(self.config.n_features))
+            nn.init.constant_(self.ma_bias, 0)
+
+        self.encoder = Encoder(self.config, random_seed)
+        self.decoder = Decoder(self.config, random_seed)
+
+        if self.config.use_cov_scaler:
+            self.cov_scaler = nn.Parameter(torch.Tensor(1))
+            nn.init.constant_(self.cov_scaler, 1)
         
-        gamma_sum = einops.rearrange(torch.einsum('kt->k', gamma), 'k -> k 1 1')
-        Sigma_hat = torch.einsum('kt,kcCt->kcC', gamma, Sigma) / gamma_sum
-        return Sigma_hat
+    def dkl_loss(self, x_mean, x_cov, x_mean_prior, x_cov_prior):
+        x_mean_diff = x_mean - x_mean_prior
+        term1 = torch.einsum('bct,bcCt,bCt->bt', x_mean_diff, x_cov_prior, x_mean_diff)
+
+        x_cov_rearranged = einops.rearrange(x_cov, 'b c C t -> b t c C')
+        x_cov_prior_rearranged = einops.rearrange(x_cov_prior, 'b c C t -> b t c C')
+        cholesky_factor = torch.linalg.cholesky(x_cov_prior_rearranged)
+        x_covcov = torch.cholesky_solve(x_cov_rearranged, cholesky_factor)
+
+        x_covcov_diag = torch.diagonal(x_covcov, dim1=2, dim2=3)
+        term2 = torch.einsum('btc->bt', x_covcov_diag)
+
+        term3_ = torch.linalg.slogdet(x_covcov)
+        term3 = term3_.sign * term3_.logabsdet
+
+        return 1/2 * (term1 + term2 - term3), term1, term2, term3
+
+    def rec_loss(self, y, y_mean_tilde, y_cov_tilde, sigma2y, ds_coef, cov_propagation=False):
+        y = einops.rearrange(y, 'b c (t d) -> b t d c', d=ds_coef)
+        y_mean_tilde = einops.rearrange(y_mean_tilde, 'b c (t d) -> b t d c', d=ds_coef)
+        y_diff = y_mean_tilde - y
+        if not cov_propagation:
+            y_diff_norm2 = torch.einsum('btdc,btdc->bt', y_diff, y_diff)
+            rec_loss = y_diff_norm2 / (2*sigma2y)
+        else:
+            y_cov_tilde = einops.rearrange(y_cov_tilde, 'b c C (t d) -> b t d c C', d=ds_coef)
+            noise_cov = sigma2y * einops.rearrange(torch.eye(y_cov_tilde.shape[-1], device=y_cov_tilde.device), 'c C -> 1 1 1 c C')
+            y_cov_tilde = y_cov_tilde + noise_cov
+            
+            _, logabsdet = torch.linalg.slogdet(y_cov_tilde) # b t d
+            logabsdet = torch.einsum('btd -> bt', logabsdet)
+
+            cholesky_factor = torch.linalg.cholesky(y_cov_tilde)
+            y_diff_ = einops.rearrange(y_mean_tilde, 'b t d c -> b t d c 1')
+            y_diff_scaled_ = torch.cholesky_solve(y_diff_, cholesky_factor)
+            y_diff_scaled = einops.rearrange(y_diff_scaled_, 'b t d c 1 -> b t d c')
+            
+            mahalanobis2 = torch.einsum('btdc, btdc -> bt', y_diff, y_diff_scaled)
+
+            rec_loss = (mahalanobis2 + logabsdet) / 2
+        return rec_loss
     
-    def _transform_covariance(self, Sigma_hat):
-        if self.config.covariance_type == 'full':
-            return Sigma_hat
-        elif self.config.covariance_type == 'diagonal':
-            identity = einops.repeat(torch.eye(self.config.n_features, device=Sigma_hat.device), 'c C -> k c C', k=self.config.n_states)
-            return Sigma_hat * identity
-        elif self.config.covariance_type == 'spherical':
-            identity = einops.repeat(torch.eye(self.config.n_features, device=Sigma_hat.device), 'c C -> k c C', k=self.config.n_states)
-            diagonal = torch.diagonal(Sigma_hat, dim1=-2, dim2=-1)
-            diagonal_mean = einops.rearrange(torch.mean(diagonal, dim=-1), 'k -> k 1 1')
-            return diagonal_mean * identity
-        elif self.config.covariance_type == 'common':
-            Sigma_mean = einops.repeat(torch.mean(Sigma_hat, dim=0), 'c C -> k c C', k=self.config.n_states)
-            return Sigma_mean
-        elif self.config.covariance_type == 'identity':
-            identity = einops.repeat(torch.eye(self.config.n_features, device=Sigma_hat.device), 'c C -> k c C', k=self.config.n_states)
-            return identity
     
     
-    def reset(self):
-        self.An = torch.zeros(
-            (self.config.n_states, self.config.ar_order + 2, self.config.n_features, self.config.n_features),
-            device=self.An.device
-        )
-        self.An[:,0,:,:] = - einops.repeat(torch.eye(self.config.n_features), 'c C -> k c C', k=self.config.n_states)
-        self.Sigma = einops.repeat(torch.eye(self.config.n_features, device=self.Sigma.device), 'c C -> k c C', k=self.config.n_states)
-        self._update_filters()
+    
+    
+    
